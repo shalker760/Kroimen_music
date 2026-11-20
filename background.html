@@ -54,9 +54,18 @@ OBR.onReady(async () => {
   };
   applyVol();
 
+  let gotOffer = false, sentAns = false, answersRx = 0, offersTx = 0;
+  const cands = (d) => {
+    const c = { host: 0, srflx: 0, relay: 0 };
+    (d?.sdp ?? "").match(/ typ (host|srflx|relay)/g)?.forEach((x) => c[x.trim().split(" ")[1]]++);
+    return `host${c.host}/srflx${c.srflx}/relay${c.relay}`;
+  };
+  const dbgText = () => isGM
+    ? `ДМ · предложений ${offersTx} · ответов ${answersRx} · ice: ${[...peers.values()].map((p) => p.pc.iceConnectionState).join(", ") || "нет игроков"} · кандидаты ${cands([...peers.values()].at(-1)?.pc.localDescription)}`
+    : `предложение ${gotOffer ? "да" : "нет"} · ответ ${sentAns ? "отправлен" : "нет"} · ice: ${pc?.iceConnectionState ?? "-"} · кандидаты ${cands(pc?.localDescription)}`;
   const nameOf = (id) => load().tracks.find((t) => t.id === id)?.name ?? "";
   const push = () => ch.postMessage({
-    type: "state", role, id: curId, name: curName, blocked, muted, vol, link,
+    type: "state", dbg: dbgText(), role, id: curId, name: curName, blocked, muted, vol, link,
     playing: isGM ? !audio.paused : rPlaying,
     time: isGM ? audio.currentTime : 0,
     duration: isGM && isFinite(audio.duration) ? audio.duration : 0,
@@ -72,6 +81,7 @@ OBR.onReady(async () => {
     peers.get(pid)?.pc.close();
     const pc = new RTCPeerConnection(ICE), oid = crypto.randomUUID();
     peers.set(pid, { pc, oid });
+    pc.oniceconnectionstatechange = push;
     streamDest.stream.getTracks().forEach((t) => pc.addTrack(t, streamDest.stream));
     pc.onconnectionstatechange = () => {
       if (["closed", "failed"].includes(pc.connectionState) && peers.get(pid)?.pc === pc) peers.delete(pid);
@@ -83,6 +93,7 @@ OBR.onReady(async () => {
       await gathered(pc);
       if (peers.get(pid)?.pc !== pc) return;
       send(SIG, { to: pid, from: myId, type: "offer", oid, sdp: pc.localDescription.sdp });
+      offersTx++; push();
     } catch {}
   }
   async function tryPlay() {
@@ -118,10 +129,11 @@ OBR.onReady(async () => {
     push();
   }
   async function accept(m) {
-    want = m.oid;
+    want = m.oid; gotOffer = true; sentAns = false;
     pc?.close();
     const mine = (pc = new RTCPeerConnection(ICE));
     const retry = () => mine === pc && mine.connectionState !== "connected" && send(HELLO, { from: myId });
+    mine.oniceconnectionstatechange = push;
     mine.ontrack = (e) => { remote.srcObject = e.streams[0]; startRemote(); };
     mine.onconnectionstatechange = () => {
       if (mine !== pc) return;
@@ -141,6 +153,7 @@ OBR.onReady(async () => {
       await gathered(mine);
       if (want !== m.oid) return;
       send(SIG, { to: m.from, from: myId, type: "answer", oid: m.oid, sdp: mine.localDescription.sdp });
+      sentAns = true; push();
     } catch {}
   }
 
@@ -150,7 +163,7 @@ OBR.onReady(async () => {
     if (isGM && m.type === "answer") {
       const p = peers.get(m.from);
       if (p && p.oid === m.oid && p.pc.signalingState === "have-local-offer")
-        await p.pc.setRemoteDescription({ type: "answer", sdp: m.sdp }).catch(() => {});
+        await p.pc.setRemoteDescription({ type: "answer", sdp: m.sdp }).then(() => { answersRx++; push(); }).catch(() => {});
     } else if (!isGM && m.type === "offer") await accept(m);
   });
   if (isGM) {
@@ -206,4 +219,4 @@ OBR.onReady(async () => {
     }
   };
 });
-</script>
+                </script>
