@@ -36,6 +36,7 @@ OBR.onReady(async () => {
   let vol = Number(localStorage.getItem("vol") ?? 0.8);
   let muted = localStorage.getItem("mute") === "1";
   let curId = null, curName = null, blocked = false, rPlaying = false, link = "connecting";
+  let missing = false, lastSync = null, localName = null;
 
   // ДМ: плеер -> (громкость для себя) + (поток для игроков). Игрок: <audio> с потоком от ДМа.
   const audio = new Audio();
@@ -51,7 +52,7 @@ OBR.onReady(async () => {
   }
   const applyVol = () => {
     if (isGM) gain.gain.value = muted ? 0 : vol;
-    else { remote.volume = vol; remote.muted = muted; }
+    else { remote.volume = audio.volume = vol; remote.muted = audio.muted = muted; }
   };
   applyVol();
 
@@ -66,7 +67,7 @@ OBR.onReady(async () => {
     : `предложение ${gotOffer ? "да" : "нет"} · ответ ${sentAns ? "отправлен" : "нет"} · ice: ${pc?.iceConnectionState ?? "-"} · кандидаты ${cs()}`;
   const nameOf = (id) => load().tracks.find((t) => t.id === id)?.name ?? "";
   const push = () => ch.postMessage({
-    type: "state", dbg: dbgText(), role, id: curId, name: curName, blocked, muted, vol, link,
+    type: "state", dbg: "v5 · " + dbgText(), role, id: curId, name: curName, missing, blocked, muted, vol, link,
     playing: isGM ? !audio.paused : rPlaying,
     time: isGM ? audio.currentTime : 0,
     duration: isGM && isFinite(audio.duration) ? audio.duration : 0,
@@ -76,7 +77,7 @@ OBR.onReady(async () => {
   // ================= ДМ =================
   let queue = [], idx = -1, url = null, announce = false, seekT;
   const peers = new Map();
-  const bc = () => isGM && send(SYNC, { name: curName, playing: !audio.paused });
+  const bc = () => isGM && send(SYNC, { name: curName, playing: !audio.paused, time: audio.currentTime });
 
   async function connect(pid) {
     peers.get(pid)?.pc.close();
@@ -133,6 +134,40 @@ OBR.onReady(async () => {
 
   // ================= Игрок =================
   let pc = null, want = null;
+  const norm = (x) => (x ?? "").trim().toLowerCase();
+  const t0 = Date.now();
+  async function setSrc(id) {
+    const rec = await getBlob(id);
+    if (!rec) return false;
+    if (url) URL.revokeObjectURL(url);
+    audio.src = url = URL.createObjectURL(rec.blob);
+    return true;
+  }
+  // Если за 8 секунд прямая связь не появилась (или оборвалась) — играем из своих файлов по названию.
+  async function follow(m) {
+    lastSync = m;
+    if (link === "connected") { audio.pause(); missing = false; return push(); }
+    if (link !== "lost" && Date.now() - t0 < 8000) { setTimeout(() => lastSync === m && follow(m), 8200); return; }
+    if (!m.name) { audio.pause(); localName = curId = null; missing = false; return push(); }
+    if (m.name !== localName) {
+      localName = m.name;
+      const t = load().tracks.find((x) => norm(x.name) === norm(m.name));
+      missing = !t; curId = t?.id ?? null;
+      audio.pause();
+      if (!t) {
+        OBR.notification.show(`Нет связи с мастером и нет файла «${m.name}». Загрузите его в плеере.`, "WARNING");
+        return push();
+      }
+      await setSrc(t.id);
+      await new Promise((r) => audio.addEventListener("loadedmetadata", r, { once: true }));
+    }
+    if (missing) return push();
+    if (Math.abs(audio.currentTime - (m.time ?? 0)) > 2) audio.currentTime = m.time ?? 0;
+    if (m.playing) {
+      try { await audio.play(); blocked = false; } catch { blocked = true; }
+    } else audio.pause();
+    push();
+  }
   async function startRemote() {
     try { await remote.play(); blocked = false; }
     catch { blocked = true; OBR.notification.show("Откройте плеер и нажмите «Включить звук»", "WARNING"); }
@@ -167,6 +202,8 @@ OBR.onReady(async () => {
       const s = mine.connectionState;
       link = s === "connected" ? "connected" : ["failed", "closed"].includes(s) ? "lost" : "connecting";
       push();
+      if (link === "connected") { audio.pause(); localName = null; missing = false; }
+      else if (link === "lost" && lastSync) follow(lastSync);
       if (s === "failed") setTimeout(retry, 1500);
       if (s === "disconnected") setTimeout(retry, 5000);
     };
@@ -213,7 +250,7 @@ OBR.onReady(async () => {
     OBR.broadcast.onMessage(READY, () => send(HELLO, { from: myId }));
     OBR.broadcast.onMessage(SYNC, ({ data: m }) => {
       if (m.name && m.name !== curName) OBR.notification.show(`Сейчас играет: ${m.name}`);
-      curName = m.name; rPlaying = m.playing; push();
+      curName = m.name; rPlaying = m.playing; push(); follow(m);
     });
     send(HELLO, { from: myId });
   }
@@ -226,8 +263,13 @@ OBR.onReady(async () => {
       case "mute": muted = !muted; localStorage.setItem("mute", muted ? 1 : 0); applyVol(); return push();
       case "unlock":
         if (isGM) return;
-        if (remote.srcObject) startRemote(); else send(HELLO, { from: myId });
+        if (remote.srcObject && link === "connected") startRemote();
+        else {
+          if (lastSync) audio.play().then(() => { blocked = false; push(); }).catch(() => {});
+          send(HELLO, { from: myId });
+        }
         return;
+      case "refresh": if (!isGM && lastSync) { localName = null; follow(lastSync); } return;
     }
     if (!isGM) return;
     switch (m.cmd) {
@@ -239,9 +281,9 @@ OBR.onReady(async () => {
         push(); return bc();
       case "next": return playAt(idx + 1);
       case "prev":
-        if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+        if (audio.currentTime > 3) { audio.currentTime = 0; return bc(); }
         return playAt(idx - 1);
-      case "seek": audio.currentTime = m.t; return;
+      case "seek": audio.currentTime = m.t; clearTimeout(seekT); seekT = setTimeout(bc, 200); return;
       case "removed": {
         const at = queue.indexOf(m.id);
         if (at === -1) return;
@@ -253,4 +295,4 @@ OBR.onReady(async () => {
     }
   };
 });
-            </script>
+                        </script>
