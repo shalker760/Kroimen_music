@@ -60,7 +60,7 @@
   <select id="view" class="gm" aria-label="Плейлист"></select>
   <button id="addpl" class="gm" title="Создать плейлист">＋ Плейлист</button>
   <button id="delpl" class="gm" title="Удалить плейлист">Удалить</button>
-  <button id="upload" class="gm" title="Загрузить песни">⬆ Песни</button>
+  <button id="upload" title="Загрузить песни">⬆ Песни</button>
   <input type="file" id="file" accept="audio/*" multiple hidden>
 </div>
 <form id="newpl" class="row gm">
@@ -68,7 +68,7 @@
   <button>Создать</button>
 </form>
 <div class="hint" id="dbg" style="font-size:11px;word-break:break-word"></div>
-<ul id="list" class="gm"></ul>
+<ul id="list"></ul>
 
 <script type="module">
 import { ch, load, save, putBlob, delBlob } from "./db.js";
@@ -144,7 +144,7 @@ function renderNow() {
   $("#dbg").textContent = st.dbg ? `Диагностика: ${st.dbg}` : "";
   if (st.role === "PLAYER") $("#hint").textContent = {
     connected: "Подключено к мастеру игры. Музыка идёт напрямую от него, файлы не нужны.",
-    lost: "Связь с мастером потеряна, пробуем переподключиться…",
+    lost: "Прямая связь не установилась. Музыка играет из ваших файлов: загрузите те же песни (названия должны совпадать с названиями у мастера).",
   }[st.link] ?? "Подключение к мастеру игры…";
   $("#toggle").textContent = st.playing ? "⏸" : "▶";
   $("#seek").max = st.duration || 0;
