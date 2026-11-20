@@ -8,9 +8,10 @@ import { ch, load, getBlob } from "./db.js";
 const SYNC = "com.obr-music/sync", HELLO = "com.obr-music/hello",
       SIG = "com.obr-music/signal", READY = "com.obr-music/dm-ready";
 const ICE = { iceServers: [
-  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478",
+           "stun:global.stun.twilio.com:3478"] },
   // TURN-ретранслятор: нужен, когда прямое соединение невозможно (мобильный интернет, строгий NAT).
-  // Публичный тестовый сервер; для надёжности замените на свои данные (metered.ca / Cloudflare).
+  // Публичный тестовый сервер; для надёжности замените на свои данные (metered.ca и т.п.).
   { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443",
            "turns:openrelay.metered.ca:443?transport=tcp"],
     username: "openrelayproject", credential: "openrelayproject" },
@@ -55,14 +56,14 @@ OBR.onReady(async () => {
   applyVol();
 
   let gotOffer = false, sentAns = false, answersRx = 0, offersTx = 0;
-  const cands = (d) => {
-    const c = { host: 0, srflx: 0, relay: 0 };
-    (d?.sdp ?? "").match(/ typ (host|srflx|relay)/g)?.forEach((x) => c[x.trim().split(" ")[1]]++);
-    return `host${c.host}/srflx${c.srflx}/relay${c.relay}`;
-  };
+  const lc = { host: 0, srflx: 0, relay: 0 }, errs = new Set();
+  const resetDbg = () => { lc.host = lc.srflx = lc.relay = 0; errs.clear(); };
+  const count = (c) => { if (c.type in lc) lc[c.type]++; };
+  const noteErr = (e) => { errs.add(`${(e.url ?? "?").replace(/^\w+:/, "")} ${e.errorCode}`); push(); };
+  const cs = () => `host${lc.host}/srflx${lc.srflx}/relay${lc.relay}${errs.size ? ` · ошибки: ${[...errs].slice(0, 3).join("; ")}` : ""}`;
   const dbgText = () => isGM
-    ? `ДМ · предложений ${offersTx} · ответов ${answersRx} · ice: ${[...peers.values()].map((p) => p.pc.iceConnectionState).join(", ") || "нет игроков"} · кандидаты ${cands([...peers.values()].at(-1)?.pc.localDescription)}`
-    : `предложение ${gotOffer ? "да" : "нет"} · ответ ${sentAns ? "отправлен" : "нет"} · ice: ${pc?.iceConnectionState ?? "-"} · кандидаты ${cands(pc?.localDescription)}`;
+    ? `ДМ · предложений ${offersTx} · ответов ${answersRx} · ice: ${[...peers.values()].map((p) => p.pc.iceConnectionState).join(", ") || "нет игроков"} · кандидаты ${cs()}`
+    : `предложение ${gotOffer ? "да" : "нет"} · ответ ${sentAns ? "отправлен" : "нет"} · ice: ${pc?.iceConnectionState ?? "-"} · кандидаты ${cs()}`;
   const nameOf = (id) => load().tracks.find((t) => t.id === id)?.name ?? "";
   const push = () => ch.postMessage({
     type: "state", dbg: dbgText(), role, id: curId, name: curName, blocked, muted, vol, link,
@@ -80,7 +81,17 @@ OBR.onReady(async () => {
   async function connect(pid) {
     peers.get(pid)?.pc.close();
     const pc = new RTCPeerConnection(ICE), oid = crypto.randomUUID();
-    peers.set(pid, { pc, oid });
+    peers.set(pid, { pc, oid, pend: [] });
+    resetDbg();
+    const out = []; let sent = false;
+    const sendC = (c) => send(SIG, { to: pid, from: myId, type: "cand", oid, c });
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      count(e.candidate);
+      sent ? sendC(e.candidate.toJSON()) : out.push(e.candidate.toJSON());
+      push();
+    };
+    pc.onicecandidateerror = noteErr;
     pc.oniceconnectionstatechange = push;
     streamDest.stream.getTracks().forEach((t) => pc.addTrack(t, streamDest.stream));
     pc.onconnectionstatechange = () => {
@@ -90,10 +101,9 @@ OBR.onReady(async () => {
       const offer = await pc.createOffer();
       offer.sdp = tune(offer.sdp);
       await pc.setLocalDescription(offer);
-      await gathered(pc);
       if (peers.get(pid)?.pc !== pc) return;
       send(SIG, { to: pid, from: myId, type: "offer", oid, sdp: pc.localDescription.sdp });
-      offersTx++; push();
+      sent = true; out.forEach(sendC); offersTx++; push();
     } catch {}
   }
   async function tryPlay() {
@@ -128,10 +138,27 @@ OBR.onReady(async () => {
     catch { blocked = true; OBR.notification.show("Откройте плеер и нажмите «Включить звук»", "WARNING"); }
     push();
   }
+  let pendC = [];
+  function flushC() {
+    if (!pc?.remoteDescription) return;
+    const keep = [];
+    for (const x of pendC) x.oid === want ? pc.addIceCandidate(x.c).catch(() => {}) : keep.push(x);
+    pendC = keep.slice(-60);
+  }
   async function accept(m) {
     want = m.oid; gotOffer = true; sentAns = false;
     pc?.close();
     const mine = (pc = new RTCPeerConnection(ICE));
+    resetDbg();
+    const out = []; let sent = false;
+    const sendC = (c) => send(SIG, { to: m.from, from: myId, type: "cand", oid: m.oid, c });
+    mine.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      count(e.candidate);
+      sent ? sendC(e.candidate.toJSON()) : out.push(e.candidate.toJSON());
+      push();
+    };
+    mine.onicecandidateerror = noteErr;
     const retry = () => mine === pc && mine.connectionState !== "connected" && send(HELLO, { from: myId });
     mine.oniceconnectionstatechange = push;
     mine.ontrack = (e) => { remote.srcObject = e.streams[0]; startRemote(); };
@@ -147,24 +174,31 @@ OBR.onReady(async () => {
     try {
       await mine.setRemoteDescription({ type: "offer", sdp: m.sdp });
       if (want !== m.oid) return;
+      flushC();
       const ans = await mine.createAnswer();
       ans.sdp = tune(ans.sdp);
       await mine.setLocalDescription(ans);
-      await gathered(mine);
       if (want !== m.oid) return;
       send(SIG, { to: m.from, from: myId, type: "answer", oid: m.oid, sdp: mine.localDescription.sdp });
-      sentAns = true; push();
+      sent = true; out.forEach(sendC); sentAns = true; push();
     } catch {}
   }
 
   // ================= Сообщения Owlbear Rodeo =================
   OBR.broadcast.onMessage(SIG, async ({ data: m }) => {
     if (m.to !== myId) return;
-    if (isGM && m.type === "answer") {
+    if (isGM) {
       const p = peers.get(m.from);
-      if (p && p.oid === m.oid && p.pc.signalingState === "have-local-offer")
-        await p.pc.setRemoteDescription({ type: "answer", sdp: m.sdp }).then(() => { answersRx++; push(); }).catch(() => {});
-    } else if (!isGM && m.type === "offer") await accept(m);
+      if (!p || p.oid !== m.oid) return;
+      if (m.type === "answer" && p.pc.signalingState === "have-local-offer") {
+        await p.pc.setRemoteDescription({ type: "answer", sdp: m.sdp })
+          .then(() => { answersRx++; push(); }).catch(() => {});
+        p.pend.splice(0).forEach((c) => p.pc.addIceCandidate(c).catch(() => {}));
+      } else if (m.type === "cand") {
+        p.pc.remoteDescription ? p.pc.addIceCandidate(m.c).catch(() => {}) : p.pend.push(m.c);
+      }
+    } else if (m.type === "offer") await accept(m);
+    else if (m.type === "cand") { pendC.push(m); flushC(); }
   });
   if (isGM) {
     const helloT = new Map();   // несколько HELLO подряд склеиваем в одно подключение
@@ -219,4 +253,4 @@ OBR.onReady(async () => {
     }
   };
 });
-                </script>
+            </script>
