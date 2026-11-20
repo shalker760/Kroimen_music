@@ -7,7 +7,12 @@ import { ch, load, getBlob } from "./db.js";
 
 const SYNC = "com.obr-music/sync", HELLO = "com.obr-music/hello",
       SIG = "com.obr-music/signal", READY = "com.obr-music/dm-ready";
-const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const ICE = { iceServers: [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443",
+           "turns:openrelay.metered.ca:443?transport=tcp"],
+    username: "openrelayproject", credential: "openrelayproject" },
+] };
 // Просим Opus о стерео и высоком битрейте (по умолчанию WebRTC сжимает как голос)
 const tune = (sdp) => sdp.replace(/(a=fmtp:\d+ [^\r\n]*useinbandfec=1)/,
   "$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000");
