@@ -9,6 +9,8 @@ const SYNC = "com.obr-music/sync", HELLO = "com.obr-music/hello",
       SIG = "com.obr-music/signal", READY = "com.obr-music/dm-ready";
 const ICE = { iceServers: [
   { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  // TURN-ретранслятор: нужен, когда прямое соединение невозможно (мобильный интернет, строгий NAT).
+  // Публичный тестовый сервер; для надёжности замените на свои данные (metered.ca / Cloudflare).
   { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443",
            "turns:openrelay.metered.ca:443?transport=tcp"],
     username: "openrelayproject", credential: "openrelayproject" },
@@ -67,18 +69,21 @@ OBR.onReady(async () => {
   const bc = () => isGM && send(SYNC, { name: curName, playing: !audio.paused });
 
   async function connect(pid) {
-    peers.get(pid)?.close();
-    const pc = new RTCPeerConnection(ICE);
-    peers.set(pid, pc);
+    peers.get(pid)?.pc.close();
+    const pc = new RTCPeerConnection(ICE), oid = crypto.randomUUID();
+    peers.set(pid, { pc, oid });
     streamDest.stream.getTracks().forEach((t) => pc.addTrack(t, streamDest.stream));
     pc.onconnectionstatechange = () => {
-      if (["closed", "failed"].includes(pc.connectionState) && peers.get(pid) === pc) peers.delete(pid);
+      if (["closed", "failed"].includes(pc.connectionState) && peers.get(pid)?.pc === pc) peers.delete(pid);
     };
-    const offer = await pc.createOffer();
-    offer.sdp = tune(offer.sdp);
-    await pc.setLocalDescription(offer);
-    await gathered(pc);
-    send(SIG, { to: pid, from: myId, type: "offer", sdp: pc.localDescription.sdp });
+    try {
+      const offer = await pc.createOffer();
+      offer.sdp = tune(offer.sdp);
+      await pc.setLocalDescription(offer);
+      await gathered(pc);
+      if (peers.get(pid)?.pc !== pc) return;
+      send(SIG, { to: pid, from: myId, type: "offer", oid, sdp: pc.localDescription.sdp });
+    } catch {}
   }
   async function tryPlay() {
     try {
@@ -106,29 +111,37 @@ OBR.onReady(async () => {
   }
 
   // ================= Игрок =================
-  let pc = null;
+  let pc = null, want = null;
   async function startRemote() {
     try { await remote.play(); blocked = false; }
     catch { blocked = true; OBR.notification.show("Откройте плеер и нажмите «Включить звук»", "WARNING"); }
     push();
   }
   async function accept(m) {
+    want = m.oid;
     pc?.close();
     const mine = (pc = new RTCPeerConnection(ICE));
+    const retry = () => mine === pc && mine.connectionState !== "connected" && send(HELLO, { from: myId });
     mine.ontrack = (e) => { remote.srcObject = e.streams[0]; startRemote(); };
     mine.onconnectionstatechange = () => {
       if (mine !== pc) return;
       const s = mine.connectionState;
-      link = s === "connected" ? "connected" : ["failed", "disconnected", "closed"].includes(s) ? "lost" : "connecting";
+      link = s === "connected" ? "connected" : ["failed", "closed"].includes(s) ? "lost" : "connecting";
       push();
-      if (s === "failed" || s === "disconnected") setTimeout(() => mine === pc && send(HELLO, { from: myId }), 2000);
+      if (s === "failed") setTimeout(retry, 1500);
+      if (s === "disconnected") setTimeout(retry, 5000);
     };
-    await mine.setRemoteDescription({ type: "offer", sdp: m.sdp });
-    const ans = await mine.createAnswer();
-    ans.sdp = tune(ans.sdp);
-    await mine.setLocalDescription(ans);
-    await gathered(mine);
-    send(SIG, { to: m.from, from: myId, type: "answer", sdp: mine.localDescription.sdp });
+    setTimeout(retry, 15000);   // не подключились за 15 секунд — пробуем заново
+    try {
+      await mine.setRemoteDescription({ type: "offer", sdp: m.sdp });
+      if (want !== m.oid) return;
+      const ans = await mine.createAnswer();
+      ans.sdp = tune(ans.sdp);
+      await mine.setLocalDescription(ans);
+      await gathered(mine);
+      if (want !== m.oid) return;
+      send(SIG, { to: m.from, from: myId, type: "answer", oid: m.oid, sdp: mine.localDescription.sdp });
+    } catch {}
   }
 
   // ================= Сообщения Owlbear Rodeo =================
@@ -136,11 +149,16 @@ OBR.onReady(async () => {
     if (m.to !== myId) return;
     if (isGM && m.type === "answer") {
       const p = peers.get(m.from);
-      if (p?.signalingState === "have-local-offer") await p.setRemoteDescription({ type: "answer", sdp: m.sdp });
+      if (p && p.oid === m.oid && p.pc.signalingState === "have-local-offer")
+        await p.pc.setRemoteDescription({ type: "answer", sdp: m.sdp }).catch(() => {});
     } else if (!isGM && m.type === "offer") await accept(m);
   });
   if (isGM) {
-    OBR.broadcast.onMessage(HELLO, ({ data: m }) => { connect(m.from); bc(); });
+    const helloT = new Map();   // несколько HELLO подряд склеиваем в одно подключение
+    OBR.broadcast.onMessage(HELLO, ({ data: m }) => {
+      clearTimeout(helloT.get(m.from));
+      helloT.set(m.from, setTimeout(() => { connect(m.from); bc(); }, 400));
+    });
     send(READY, {});
     audio.onended = () => playAt(idx + 1);
     ["play", "pause", "loadedmetadata", "timeupdate"].forEach((e) => audio.addEventListener(e, push));
