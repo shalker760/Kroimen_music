@@ -4,13 +4,13 @@
   "manifest_version": 1,
   "description": "Загружайте свою музыку, создавайте плейлисты и включайте её во время игры.",
   "author": "You",
-  "icon": "/icon.svg",
+  "icon": "https://shalker760.github.io/Kroimen_music/icon.svg",
   "action": {
     "title": "Музыка",
-    "icon": "/icon.svg",
-    "popover": "/popover.html",
+    "icon": "https://shalker760.github.io/Kroimen_music/icon.svg",
+    "popover": "https://shalker760.github.io/Kroimen_music/popover.html",
     "width": 360,
     "height": 540
   },
-  "background_url": "/background.html"
+  "background_url": "https://shalker760.github.io/Kroimen_music/background.html"
 }
