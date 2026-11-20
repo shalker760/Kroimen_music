@@ -67,6 +67,7 @@
   <input id="plname" placeholder="Название плейлиста" maxlength="40">
   <button>Создать</button>
 </form>
+<div class="hint" id="dbg" style="font-size:11px;word-break:break-word"></div>
 <ul id="list" class="gm"></ul>
 
 <script type="module">
@@ -140,6 +141,7 @@ function renderNow() {
   title.classList.toggle("idle", !st.name);
   $("#unlock").style.display = st.blocked ? "" : "none";
   $("#mute").textContent = st.muted ? "🔇" : "🔊";
+  $("#dbg").textContent = st.dbg ? `Диагностика: ${st.dbg}` : "";
   if (st.role === "PLAYER") $("#hint").textContent = {
     connected: "Подключено к мастеру игры. Музыка идёт напрямую от него, файлы не нужны.",
     lost: "Связь с мастером потеряна, пробуем переподключиться…",
