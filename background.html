@@ -1,0 +1,186 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Music background</title>
+<script type="module">
+import OBR from "https://esm.sh/@owlbear-rodeo/sdk";
+import { ch, load, getBlob } from "./db.js";
+
+const SYNC = "com.obr-music/sync", HELLO = "com.obr-music/hello",
+      SIG = "com.obr-music/signal", READY = "com.obr-music/dm-ready";
+const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+// Просим Opus о стерео и высоком битрейте (по умолчанию WebRTC сжимает как голос)
+const tune = (sdp) => sdp.replace(/(a=fmtp:\d+ [^\r\n]*useinbandfec=1)/,
+  "$1;stereo=1;sprop-stereo=1;maxaveragebitrate=128000");
+
+OBR.onReady(async () => {
+  const isGM = (await OBR.player.getRole()) === "GM";
+  const role = isGM ? "GM" : "PLAYER";
+  const myId = await OBR.player.getId();
+  const send = (channel, data) => OBR.broadcast.sendMessage(channel, data);
+  const gathered = (pc) => new Promise((res) => {
+    if (pc.iceGatheringState === "complete") return res();
+    const t = setTimeout(res, 3000);
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); }
+    });
+  });
+
+  let vol = Number(localStorage.getItem("vol") ?? 0.8);
+  let muted = localStorage.getItem("mute") === "1";
+  let curId = null, curName = null, blocked = false, rPlaying = false, link = "connecting";
+
+  // ДМ: плеер -> (громкость для себя) + (поток для игроков). Игрок: <audio> с потоком от ДМа.
+  const audio = new Audio();
+  let ctx, gain, streamDest;
+  const remote = new Audio();
+  if (isGM) {
+    ctx = new AudioContext();
+    const src = ctx.createMediaElementSource(audio);
+    gain = ctx.createGain();
+    streamDest = ctx.createMediaStreamDestination();
+    src.connect(gain); gain.connect(ctx.destination);
+    src.connect(streamDest);
+  }
+  const applyVol = () => {
+    if (isGM) gain.gain.value = muted ? 0 : vol;
+    else { remote.volume = vol; remote.muted = muted; }
+  };
+  applyVol();
+
+  const nameOf = (id) => load().tracks.find((t) => t.id === id)?.name ?? "";
+  const push = () => ch.postMessage({
+    type: "state", role, id: curId, name: curName, blocked, muted, vol, link,
+    playing: isGM ? !audio.paused : rPlaying,
+    time: isGM ? audio.currentTime : 0,
+    duration: isGM && isFinite(audio.duration) ? audio.duration : 0,
+  });
+  const say = () => OBR.notification.show(`Сейчас играет: ${curName}`);
+
+  // ================= ДМ =================
+  let queue = [], idx = -1, url = null, announce = false, seekT;
+  const peers = new Map();
+  const bc = () => isGM && send(SYNC, { name: curName, playing: !audio.paused });
+
+  async function connect(pid) {
+    peers.get(pid)?.close();
+    const pc = new RTCPeerConnection(ICE);
+    peers.set(pid, pc);
+    streamDest.stream.getTracks().forEach((t) => pc.addTrack(t, streamDest.stream));
+    pc.onconnectionstatechange = () => {
+      if (["closed", "failed"].includes(pc.connectionState) && peers.get(pid) === pc) peers.delete(pid);
+    };
+    const offer = await pc.createOffer();
+    offer.sdp = tune(offer.sdp);
+    await pc.setLocalDescription(offer);
+    await gathered(pc);
+    send(SIG, { to: pid, from: myId, type: "offer", sdp: pc.localDescription.sdp });
+  }
+  async function tryPlay() {
+    try {
+      await ctx.resume();
+      if (ctx.state !== "running") throw 0;
+      await audio.play(); blocked = false; return true;
+    } catch { blocked = true; return false; }
+  }
+  async function playAt(n) {
+    if (!queue.length) return stop();
+    idx = (n + queue.length) % queue.length;
+    curId = queue[idx];
+    const rec = await getBlob(curId);
+    if (!rec) { queue.splice(idx, 1); return playAt(idx); }
+    if (url) URL.revokeObjectURL(url);
+    audio.src = url = URL.createObjectURL(rec.blob);
+    curName = nameOf(curId);
+    if (await tryPlay()) say();
+    else { announce = true; OBR.notification.show("Нажмите ▶ в плеере, чтобы начать воспроизведение", "WARNING"); }
+    push(); bc();
+  }
+  function stop() {
+    audio.pause(); audio.removeAttribute("src");
+    queue = []; idx = -1; curId = curName = null; push(); bc();
+  }
+
+  // ================= Игрок =================
+  let pc = null;
+  async function startRemote() {
+    try { await remote.play(); blocked = false; }
+    catch { blocked = true; OBR.notification.show("Откройте плеер и нажмите «Включить звук»", "WARNING"); }
+    push();
+  }
+  async function accept(m) {
+    pc?.close();
+    const mine = (pc = new RTCPeerConnection(ICE));
+    mine.ontrack = (e) => { remote.srcObject = e.streams[0]; startRemote(); };
+    mine.onconnectionstatechange = () => {
+      if (mine !== pc) return;
+      const s = mine.connectionState;
+      link = s === "connected" ? "connected" : ["failed", "disconnected", "closed"].includes(s) ? "lost" : "connecting";
+      push();
+      if (s === "failed" || s === "disconnected") setTimeout(() => mine === pc && send(HELLO, { from: myId }), 2000);
+    };
+    await mine.setRemoteDescription({ type: "offer", sdp: m.sdp });
+    const ans = await mine.createAnswer();
+    ans.sdp = tune(ans.sdp);
+    await mine.setLocalDescription(ans);
+    await gathered(mine);
+    send(SIG, { to: m.from, from: myId, type: "answer", sdp: mine.localDescription.sdp });
+  }
+
+  // ================= Сообщения Owlbear Rodeo =================
+  OBR.broadcast.onMessage(SIG, async ({ data: m }) => {
+    if (m.to !== myId) return;
+    if (isGM && m.type === "answer") {
+      const p = peers.get(m.from);
+      if (p?.signalingState === "have-local-offer") await p.setRemoteDescription({ type: "answer", sdp: m.sdp });
+    } else if (!isGM && m.type === "offer") await accept(m);
+  });
+  if (isGM) {
+    OBR.broadcast.onMessage(HELLO, ({ data: m }) => { connect(m.from); bc(); });
+    send(READY, {});
+    audio.onended = () => playAt(idx + 1);
+    ["play", "pause", "loadedmetadata", "timeupdate"].forEach((e) => audio.addEventListener(e, push));
+  } else {
+    OBR.broadcast.onMessage(READY, () => send(HELLO, { from: myId }));
+    OBR.broadcast.onMessage(SYNC, ({ data: m }) => {
+      if (m.name && m.name !== curName) OBR.notification.show(`Сейчас играет: ${m.name}`);
+      curName = m.name; rPlaying = m.playing; push();
+    });
+    send(HELLO, { from: myId });
+  }
+
+  // ================= Команды из плеера (popover) =================
+  ch.onmessage = async ({ data: m }) => {
+    switch (m.cmd) {
+      case "getState": return push();
+      case "vol": vol = m.v; localStorage.setItem("vol", vol); applyVol(); return push();
+      case "mute": muted = !muted; localStorage.setItem("mute", muted ? 1 : 0); applyVol(); return push();
+      case "unlock":
+        if (isGM) return;
+        if (remote.srcObject) startRemote(); else send(HELLO, { from: myId });
+        return;
+    }
+    if (!isGM) return;
+    switch (m.cmd) {
+      case "play": queue = m.queue; return playAt(m.index);
+      case "toggle":
+        if (!audio.src) return;
+        if (audio.paused) { if ((await tryPlay()) && announce) { announce = false; say(); } }
+        else audio.pause();
+        push(); return bc();
+      case "next": return playAt(idx + 1);
+      case "prev":
+        if (audio.currentTime > 3) { audio.currentTime = 0; return; }
+        return playAt(idx - 1);
+      case "seek": audio.currentTime = m.t; return;
+      case "removed": {
+        const at = queue.indexOf(m.id);
+        if (at === -1) return;
+        queue.splice(at, 1);
+        if (at === idx) return queue.length ? playAt(idx) : stop();
+        if (at < idx) idx--;
+        return;
+      }
+    }
+  };
+});
+</script>

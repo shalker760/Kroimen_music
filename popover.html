@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Музыка</title>
+<style>
+  :root { --bg:#14171c; --panel:#1d2128; --line:#2b313b; --text:#e8e6e1; --muted:#8b93a0; --accent:#e3b04b; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; display:flex; flex-direction:column; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, sans-serif; }
+  button, select, input { font:inherit; color:inherit; }
+  button { background:none; border:0; cursor:pointer; padding:6px 8px; border-radius:6px; }
+  button:hover { background:var(--line); }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  .now { padding:14px; background:var(--panel); border-bottom:1px solid var(--line); }
+  #title { font-size:16px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-height:22px; }
+  #title.idle { color:var(--muted); font-weight:400; }
+  .row { display:flex; align-items:center; gap:8px; }
+  .ctrl { justify-content:center; margin:6px 0; }
+  .ctrl button { font-size:18px; }
+  #toggle { background:var(--accent); color:#14171c; width:44px; height:44px; border-radius:50%; font-size:18px; }
+  #toggle:hover { background:#f0c15f; }
+  input[type=range] { flex:1; accent-color:var(--accent); }
+  .time { color:var(--muted); font-variant-numeric:tabular-nums; font-size:12px; min-width:34px; }
+  .bar { padding:10px 14px; gap:6px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  .bar select { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:5px; }
+  .bar button { border:1px solid var(--line); }
+  #newpl { display:none; padding:8px 14px; gap:6px; border-bottom:1px solid var(--line); }
+  #newpl input { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  #list { flex:1; overflow-y:auto; margin:0; padding:6px 8px; list-style:none; }
+  #list li { display:flex; align-items:center; gap:4px; border-radius:6px; }
+  #list li.cur { background:var(--panel); box-shadow:inset 3px 0 var(--accent); }
+  #list .name { flex:1; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #list select { width:28px; background:none; border:0; color:var(--muted); cursor:pointer; }
+  .empty { color:var(--muted); padding:20px 10px; text-align:center; }
+  .del { color:var(--muted); }
+  .hint { color:var(--muted); padding:8px 14px; font-size:12px; border-bottom:1px solid var(--line); }
+  body[data-role=PLAYER] .gm, body:not([data-role]) .gm { display:none !important; }
+  body:not([data-role=PLAYER]) .plo { display:none; }
+</style>
+
+<div class="now">
+  <div id="title" class="idle">Ничего не играет</div>
+  <div class="row gm"><span class="time" id="t0">0:00</span>
+    <input type="range" id="seek" min="0" max="0" step="1" value="0" aria-label="Перемотка">
+    <span class="time" id="t1">0:00</span></div>
+  <div class="row ctrl gm">
+    <button id="prev" title="Предыдущая" aria-label="Предыдущая">⏮</button>
+    <button id="toggle" title="Играть / пауза" aria-label="Играть или пауза">▶</button>
+    <button id="next" title="Следующая" aria-label="Следующая">⏭</button>
+  </div>
+  <div class="row ctrl plo"><button id="unlock" style="display:none">▶ Включить звук</button></div>
+  <div class="row"><span aria-hidden="true">🔈</span>
+    <input type="range" id="vol" min="0" max="1" step="0.01" aria-label="Громкость">
+    <button id="mute" class="plo" title="Выключить / включить музыку">🔊</button></div>
+</div>
+<div class="hint plo" id="hint">Подключение к мастеру игры…</div>
+
+<div class="row bar">
+  <select id="view" class="gm" aria-label="Плейлист"></select>
+  <button id="addpl" class="gm" title="Создать плейлист">＋ Плейлист</button>
+  <button id="delpl" class="gm" title="Удалить плейлист">Удалить</button>
+  <button id="upload" class="gm" title="Загрузить песни">⬆ Песни</button>
+  <input type="file" id="file" accept="audio/*" multiple hidden>
+</div>
+<form id="newpl" class="row gm">
+  <input id="plname" placeholder="Название плейлиста" maxlength="40">
+  <button>Создать</button>
+</form>
+<ul id="list" class="gm"></ul>
+
+<script type="module">
+import { ch, load, save, putBlob, delBlob } from "./db.js";
+
+const $ = (s) => document.querySelector(s);
+let lib = load(), view = "all", st = {};
+const uid = () => crypto.randomUUID();
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const send = (m) => ch.postMessage(m);
+const playlist = () => lib.playlists.find((p) => p.id === view);
+const viewIds = () => (view === "all" ? lib.tracks.map((t) => t.id) : playlist()?.ids ?? []);
+
+function renderView() {
+  const sel = $("#view");
+  sel.replaceChildren(new Option("Вся библиотека", "all"),
+    ...lib.playlists.map((p) => new Option(`♫ ${p.name}`, p.id)));
+  sel.value = view;
+  $("#delpl").style.display = view === "all" ? "none" : "";
+}
+
+function renderList() {
+  const ul = $("#list"); ul.replaceChildren();
+  const ids = viewIds();
+  if (!ids.length) {
+    const li = document.createElement("li");
+    li.className = "empty"; li.style.display = "block";
+    li.textContent = view === "all" ? "Библиотека пуста. Нажмите «⬆ Песни», чтобы загрузить музыку."
+                                    : "Плейлист пуст. Добавьте песни кнопкой ＋ в библиотеке.";
+    return ul.append(li);
+  }
+  ids.forEach((id, i) => {
+    const t = lib.tracks.find((x) => x.id === id); if (!t) return;
+    const li = document.createElement("li");
+    if (st.id === id) li.className = "cur";
+    const name = document.createElement("button");
+    name.className = "name"; name.textContent = t.name; name.title = t.name;
+    name.onclick = () => st.role !== "PLAYER" && send({ cmd: "play", queue: ids, index: i });
+    li.append(name);
+    if (view === "all" && lib.playlists.length) {
+      const add = document.createElement("select");
+      add.title = "Добавить в плейлист";
+      add.append(new Option("＋", ""), ...lib.playlists.map((p) => new Option(p.name, p.id)));
+      add.onchange = () => {
+        const p = lib.playlists.find((x) => x.id === add.value);
+        if (p && !p.ids.includes(id)) p.ids.push(id);
+        save(lib); add.value = "";
+      };
+      li.append(add);
+    }
+    const del = document.createElement("button");
+    del.className = "del"; del.textContent = "✕";
+    del.title = view === "all" ? "Удалить песню" : "Убрать из плейлиста";
+    del.onclick = async () => {
+      if (view === "all") {
+        lib.tracks = lib.tracks.filter((x) => x.id !== id);
+        lib.playlists.forEach((p) => (p.ids = p.ids.filter((x) => x !== id)));
+        await delBlob(id); send({ cmd: "removed", id });
+      } else playlist().ids = playlist().ids.filter((x) => x !== id);
+      save(lib); renderList();
+    };
+    li.append(del);
+    ul.append(li);
+  });
+}
+
+function renderNow() {
+  const title = $("#title");
+  if (st.role) document.body.dataset.role = st.role;
+  title.textContent = st.name ? (st.missing ? `⚠ Нет файла: ${st.name}` : st.name) : "Ничего не играет";
+  title.classList.toggle("idle", !st.name);
+  $("#unlock").style.display = st.blocked ? "" : "none";
+  $("#mute").textContent = st.muted ? "🔇" : "🔊";
+  if (st.role === "PLAYER") $("#hint").textContent = {
+    connected: "Подключено к мастеру игры. Музыка идёт напрямую от него, файлы не нужны.",
+    lost: "Связь с мастером потеряна, пробуем переподключиться…",
+  }[st.link] ?? "Подключение к мастеру игры…";
+  $("#toggle").textContent = st.playing ? "⏸" : "▶";
+  $("#seek").max = st.duration || 0;
+  $("#seek").value = st.time || 0;
+  $("#t0").textContent = fmt(st.time || 0);
+  $("#t1").textContent = fmt(st.duration || 0);
+  if (st.vol != null) $("#vol").value = st.vol;
+}
+
+$("#view").onchange = (e) => { view = e.target.value; renderView(); renderList(); };
+$("#toggle").onclick = () => send({ cmd: "toggle" });
+$("#prev").onclick = () => send({ cmd: "prev" });
+$("#next").onclick = () => send({ cmd: "next" });
+$("#seek").oninput = (e) => send({ cmd: "seek", t: +e.target.value });
+$("#vol").oninput = (e) => send({ cmd: "vol", v: +e.target.value });
+$("#unlock").onclick = () => send({ cmd: "unlock" });
+$("#mute").onclick = () => send({ cmd: "mute" });
+$("#upload").onclick = () => $("#file").click();
+$("#file").onchange = async (e) => {
+  for (const f of e.target.files) {
+    const id = uid();
+    await putBlob(id, f);
+    lib.tracks.push({ id, name: f.name.replace(/\.[^.]+$/, "") });
+  }
+  e.target.value = ""; save(lib); renderList(); send({ cmd: "refresh" });
+};
+$("#addpl").onclick = () => { $("#newpl").style.display = "flex"; $("#plname").focus(); };
+$("#newpl").onsubmit = (e) => {
+  e.preventDefault();
+  const name = $("#plname").value.trim(); if (!name) return;
+  const p = { id: uid(), name, ids: [] };
+  lib.playlists.push(p); save(lib); view = p.id;
+  $("#plname").value = ""; $("#newpl").style.display = "none";
+  renderView(); renderList();
+};
+$("#delpl").onclick = () => {
+  lib.playlists = lib.playlists.filter((p) => p.id !== view);
+  save(lib); view = "all"; renderView(); renderList();
+};
+
+ch.onmessage = ({ data: m }) => {
+  if (m.type !== "state") return;
+  const changed = m.id !== st.id; st = m; renderNow(); if (changed) renderList();
+};
+
+renderView(); renderList(); renderNow(); send({ cmd: "getState" });
+</script>
+</html>
